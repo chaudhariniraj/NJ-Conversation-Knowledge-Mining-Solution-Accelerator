@@ -96,6 +96,134 @@ function Resolve-ScenarioDataPath {
     return $null
 }
 
+function Get-FoundryProjectInfo {
+    param([string]$AgentEndpoint)
+
+    if (-not $AgentEndpoint) {
+        throw "AZURE_AI_AGENT_ENDPOINT is required to configure the AI Foundry connection."
+    }
+
+    $endpointUri = [Uri]$AgentEndpoint
+    $hostParts = $endpointUri.Host.Split('.')
+    if ($hostParts.Count -lt 1) {
+        throw "Could not parse AI Foundry account name from endpoint: $AgentEndpoint"
+    }
+    $foundryAccountName = $hostParts[0]
+
+    $projectName = $null
+    if ($endpointUri.AbsolutePath -match '/api/projects/([^/]+)$') {
+        $projectName = $matches[1]
+    } elseif ($endpointUri.AbsolutePath -match '/projects/([^/]+)$') {
+        $projectName = $matches[1]
+    }
+
+    if (-not $projectName) {
+        throw "Could not parse AI Foundry project name from endpoint: $AgentEndpoint"
+    }
+
+    return @{
+        FoundryAccountName = $foundryAccountName
+        ProjectName = $projectName
+    }
+}
+
+function Ensure-AgentSearchConnection {
+    param(
+        [string]$SearchEndpoint
+    )
+
+    if (-not $SearchEndpoint) {
+        throw "Azure AI Search endpoint is required to create the AI Foundry connection."
+    }
+
+    $normalizedSearchEndpoint = $SearchEndpoint.TrimEnd('/')
+    $searchUri = [Uri]$normalizedSearchEndpoint
+    $searchServiceName = $searchUri.Host.Split('.')[0]
+
+    $subscriptionId = azd env get-value AZURE_SUBSCRIPTION_ID 2>$null
+    if (-not $subscriptionId) {
+        $subscriptionId = az account show --query id -o tsv 2>$null
+    }
+    if (-not $subscriptionId) {
+        throw "Could not resolve Azure subscription id. Run 'az login' and 'azd env refresh'."
+    }
+
+    $resourceGroupName = azd env get-value RESOURCE_GROUP_NAME 2>$null
+    if (-not $resourceGroupName) {
+        $resourceGroupName = azd env get-value AZURE_RESOURCE_GROUP 2>$null
+    }
+    if (-not $resourceGroupName) {
+        throw "Could not resolve resource group name from azd env (RESOURCE_GROUP_NAME)."
+    }
+
+    $agentEndpoint = azd env get-value AZURE_AI_AGENT_ENDPOINT 2>$null
+    if (-not $agentEndpoint) {
+        $agentEndpoint = $env:AZURE_AI_AGENT_ENDPOINT
+    }
+
+    $projectInfo = Get-FoundryProjectInfo -AgentEndpoint $agentEndpoint
+    $foundryAccountName = $projectInfo.FoundryAccountName
+    $projectName = $projectInfo.ProjectName
+
+    $connectionsUrl = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName/projects/$projectName/connections?api-version=2025-10-01-preview"
+    $connectionsRaw = az rest --method get --url $connectionsUrl 2>$null
+    if (-not $connectionsRaw) {
+        throw "Failed to query existing AI Foundry project connections."
+    }
+
+    $connections = ($connectionsRaw | ConvertFrom-Json).value
+    if (-not $connections) {
+        $connections = @()
+    }
+
+    $existingSearchConnection = $connections | Where-Object {
+        $_.properties.category -eq "CognitiveSearch" -and
+        $_.properties.target -and
+        ($_.properties.target.TrimEnd('/').ToLowerInvariant() -eq $normalizedSearchEndpoint.ToLowerInvariant())
+    } | Select-Object -First 1
+
+    if ($existingSearchConnection) {
+        return (($existingSearchConnection.name -split '/')[-1])
+    }
+
+    $searchResource = az resource list --name $searchServiceName --resource-type "Microsoft.Search/searchServices" --query "[0].{id:id,location:location}" -o json 2>$null | ConvertFrom-Json
+    if (-not $searchResource -or -not $searchResource.id) {
+        throw "Could not resolve Azure AI Search resource id for service '$searchServiceName'."
+    }
+
+    $connectionName = "search-connection-$(Get-Random -Maximum 99999999)"
+
+    $connectionExists = $connections | Where-Object {
+        (($_.name -split '/')[-1]) -eq $connectionName
+    } | Select-Object -First 1
+
+    while ($connectionExists) {
+        $connectionName = "search-connection-$(Get-Random -Maximum 99999999)"
+        $connectionExists = $connections | Where-Object {
+            (($_.name -split '/')[-1]) -eq $connectionName
+        } | Select-Object -First 1
+    }
+
+    $resourceId = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.CognitiveServices/accounts/$foundryAccountName/projects/$projectName/connections/$connectionName"
+    $createUrl = "https://management.azure.com$resourceId?api-version=2025-10-01-preview"
+    $payload = @{
+        properties = @{
+            category = "CognitiveSearch"
+            target = $normalizedSearchEndpoint
+            authType = "AAD"
+            isSharedToAll = $true
+            metadata = @{
+                ApiType = "Azure"
+                ResourceId = $searchResource.id
+                location = $searchResource.location
+            }
+        }
+    } | ConvertTo-Json -Depth 10 -Compress
+
+    $null = az rest --method put --url $createUrl --body $payload --headers "Content-Type=application/json" 2>$null
+    return $connectionName
+}
+
 # ── Resolve backend URL ──
 if ($PSBoundParameters.ContainsKey("BackendUrl")) {
     Write-Host "Using explicit backend: $BackendUrl" -ForegroundColor Yellow
@@ -204,9 +332,12 @@ if (-not $Scenario -and -not $DataPath -and -not $UseSampleData -and -not $Exter
     switch ($selected.type) {
         "scenario" { $Scenario = $selected.key }
         "data_source" {
+            $ExternalSource = $selected.key
             Write-Host ""
-            & (Join-Path $PSScriptRoot "connect-data.ps1") -Type $selected.key
-            exit $LASTEXITCODE
+            Write-Host "Selected external source: $($selected.name)" -ForegroundColor Yellow
+            # Write-Host ""
+            # & (Join-Path $PSScriptRoot "connect-data.ps1") -Type $selected.key
+            # exit $LASTEXITCODE
         }
         "skip" {
             Write-Host "Skipped. You can upload documents from the web UI." -ForegroundColor Yellow
@@ -456,10 +587,53 @@ if ($ExternalSource) {
     if ($Table)            { $pyArgs += "--table", $Table }
     if ($ConnectionString) { $pyArgs += "--connection-string", $ConnectionString }
 
-    python (Join-Path $PSScriptRoot "connect-data.py") @pyArgs
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "External data source connection failed." -ForegroundColor Red
-        exit 1
+    # python (Join-Path $PSScriptRoot "connect-data.py") @pyArgs
+    # if ($LASTEXITCODE -ne 0) {
+    #     Write-Host "External data source connection failed." -ForegroundColor Red
+    #     exit 1
+    # }
+
+    if ($ExternalSource -eq "azure_search") {
+        Write-Host ""
+        Write-Host "Configuring AI agent to use the connected Azure AI Search index..." -ForegroundColor Yellow
+
+        $resolvedSearchEndpoint = $Endpoint
+        if (-not $resolvedSearchEndpoint) {
+            $resolvedSearchEndpoint = Read-Host "Azure AI Search endpoint for the agent connection"
+        }
+        if (-not $resolvedSearchEndpoint) {
+            Write-Host "ERROR: Azure AI Search endpoint is required to configure the agent connection." -ForegroundColor Red
+            exit 1
+        }
+
+        $resolvedSearchIndexName = $Table
+        if (-not $resolvedSearchIndexName) {
+            $resolvedSearchIndexName = Read-Host "Azure AI Search index name for the agent"
+        }
+        if (-not $resolvedSearchIndexName) {
+            Write-Host "ERROR: Azure AI Search index name is required to configure the agent." -ForegroundColor Red
+            exit 1
+        }
+
+        try {
+            $resolvedConnectionName = Ensure-AgentSearchConnection -SearchEndpoint $resolvedSearchEndpoint
+            azd env set AZURE_AI_SEARCH_CONNECTION_NAME $resolvedConnectionName 2>$null | Out-Null
+            $env:AZURE_AI_SEARCH_CONNECTION_NAME = $resolvedConnectionName
+            Write-Host "Using AI Foundry search connection: $resolvedConnectionName" -ForegroundColor Green
+        } catch {
+            Write-Host "ERROR: Failed to create/reuse AI Foundry search connection. $_" -ForegroundColor Red
+            exit 1
+        }
+
+        $setupAgentScript = Join-Path $PSScriptRoot "setup-agent.ps1"
+        if ($Scenario) {
+            & $setupAgentScript -Scenario $Scenario -SearchIndexName $resolvedSearchIndexName -SearchConnectionName $resolvedConnectionName
+        } else {
+            & $setupAgentScript -SearchIndexName $resolvedSearchIndexName -SearchConnectionName $resolvedConnectionName
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: Agent setup failed — retry with: ./scripts/setup-agent.ps1 -SearchIndexName $resolvedSearchIndexName -SearchConnectionName $resolvedConnectionName" -ForegroundColor Yellow
+        }
     }
 }
 

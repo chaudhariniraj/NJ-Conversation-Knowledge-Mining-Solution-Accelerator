@@ -59,8 +59,17 @@ SOURCE_TYPES = {
         "label": "Azure AI Search",
         "fields": ["endpoint", "table"],
         "prompts": {
-            "endpoint": "Search endpoint (e.g. https://my-search.search.windows.net): ",
-            "table": "Index name: ",
+            "endpoint": (
+                "\nEnter your Azure AI Search endpoint.\n"
+                "  Example: https://my-company-search.search.windows.net\n"
+                "  Find it at: Azure Portal → Your Azure AI Search resource → URL (Endpoint)\n"
+                "Endpoint: "
+            ),
+            "table": (
+                "\nEnter the Azure AI Search index name.\n"
+                "  Find it at: Azure Portal → Your Azure AI Search resource → Search management → Indexes\n"
+                "Index name: "
+            ),
         },
     },
     "2": {
@@ -169,16 +178,31 @@ def save_data_source(conn, data: dict):
 # ---------------------------------------------------------------------------
 # Connection testing (uses the adapter classes directly)
 # ---------------------------------------------------------------------------
+def validate_config(config: dict) -> tuple[bool, str]:
+    """Validate that required fields are provided for the given source type."""
+    source_type = config.get("source_type", "")
+    
+    if source_type == "azure_search":
+        if not config.get("endpoint"):
+            return False, "Azure Search endpoint is required (e.g., https://my-search.search.windows.net)"
+        if not config.get("table_or_query"):
+            return False, "Azure Search index name is required"
+       
+    return True, ""
+
+
 def test_source_connection(config: dict) -> dict:
     """Test the data source connection using the app's adapter classes."""
-    # Add src to path so we can import adapters
-    sys.path.insert(0, os.path.join(project_root, "src"))
+    # Add project root to path so we can import adapters
+    sys.path.insert(0, project_root)
 
-    from api.modules.data_sources.base import DataSourceConfig, DataSourceType
+    from src.api.modules.data_sources.base import DataSourceConfig, DataSourceType
 
     adapter_map = {
-        "azure_search": "api.modules.data_sources.azure_search",
-        "fabric": "api.modules.data_sources.fabric",
+        "azure_search": "src.api.modules.data_sources.azure_search",
+        "fabric": "src.api.modules.data_sources.fabric",
+        "sql": "src.api.modules.data_sources.sql",
+        "synapse": "src.api.modules.data_sources.synapse",
     }
 
     source_type = config["source_type"]
@@ -215,6 +239,23 @@ def test_source_connection(config: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Interactive prompts
 # ---------------------------------------------------------------------------
+def get_input(prompt: str, field_name: str = "", allow_empty: bool = False) -> str:
+    """Collect user input with validation."""
+    while True:
+        try:
+            value = input(prompt).strip()
+            if not value and not allow_empty:
+                print(f"  ⚠ {field_name} cannot be empty. Please try again.")
+                continue
+            return value
+        except KeyboardInterrupt:
+            print("\n\nCancelled by user.")
+            sys.exit(0)
+        except EOFError:
+            print("\n\nEnd of input.")
+            sys.exit(1)
+
+
 def interactive_prompts() -> dict:
     """Gather data source config via interactive prompts."""
     print()
@@ -224,7 +265,7 @@ def interactive_prompts() -> dict:
         print(f"  {key}. {info['label']}")
     print()
 
-    choice = input("Enter choice (1-2): ").strip()
+    choice = get_input("Enter choice (1-2): ", "Choice").strip()
     if choice not in SOURCE_TYPES:
         print(f"Invalid choice: {choice}")
         sys.exit(1)
@@ -233,14 +274,16 @@ def interactive_prompts() -> dict:
     print(f"\nConfiguring {source['label']}...")
     print()
 
-    name = input("Display name for this data source: ").strip()
+    name = get_input("Display name for this data source: ", "Display name", allow_empty=True)
     if not name:
         name = source["label"]
 
     config = {"name": name, "source_type": source["type"]}
 
     for field in source["fields"]:
-        value = input(source["prompts"][field]).strip()
+        prompt_text = source["prompts"][field]
+        value = get_input(prompt_text, field, allow_empty=False)
+        
         if field == "table":
             config["table_or_query"] = value
         elif field == "connection_string":
@@ -285,6 +328,40 @@ def main():
             "table_or_query": args.table or "",
             "connection_string": args.connection_string or "",
         }
+        
+        # Check if required fields are missing; if so, prompt interactively
+        source_type_info = SOURCE_TYPES.get(
+            next((k for k, v in SOURCE_TYPES.items() if v["type"] == args.type), None)
+        )
+        
+        if source_type_info:
+            print(f"\nConfiguring {source_type_info['label']}...")
+            missing_fields = []
+            
+            for field in source_type_info["fields"]:
+                if field == "table":
+                    if not config.get("table_or_query"):
+                        missing_fields.append(field)
+                elif field == "connection_string":
+                    if not config.get("connection_string"):
+                        missing_fields.append(field)
+                else:
+                    if not config.get(field):
+                        missing_fields.append(field)
+            
+            # If any required fields are missing, prompt for them
+            if missing_fields:
+                print()
+                for field in missing_fields:
+                    prompt_text = source_type_info["prompts"][field]
+                    value = get_input(prompt_text, field, allow_empty=False)
+                    
+                    if field == "table":
+                        config["table_or_query"] = value
+                    elif field == "connection_string":
+                        config["connection_string"] = value
+                    else:
+                        config[field] = value
     else:
         config = interactive_prompts()
 
@@ -294,6 +371,12 @@ def main():
         print(f"  Endpoint: {config['endpoint']}")
     if config.get("table_or_query"):
         print(f"  Table   : {config['table_or_query']}")
+
+    # Validate required fields before testing
+    is_valid, error_msg = validate_config(config)
+    if not is_valid:
+        print(f"\n  [FAIL] {error_msg}")
+        sys.exit(1)
 
     # Step 1: Test connection
     print("\n  Testing connection...")

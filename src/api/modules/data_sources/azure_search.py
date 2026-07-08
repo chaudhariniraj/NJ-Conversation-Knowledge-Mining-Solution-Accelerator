@@ -20,10 +20,26 @@ class AzureSearchDataSource(BaseExternalDataSource):
     """Adapter for Azure AI Search — enables BYOI (bring your own index)."""
 
     def _get_client(self, config: DataSourceConfig) -> SearchClient:
+        # Validate required fields
+        endpoint = config.endpoint.strip() if config.endpoint else ""
+        index_name = config.table_or_query.strip() if config.table_or_query else ""
+        
+        if not endpoint:
+            raise ValueError("Azure Search endpoint is required (e.g., https://my-search.search.windows.net)")
+        if not index_name:
+            raise ValueError("Azure Search index name is required")
+        
+        # Ensure endpoint uses HTTPS
+        if not endpoint.startswith("https://"):
+            if endpoint.startswith("http://"):
+                endpoint = endpoint.replace("http://", "https://", 1)
+            else:
+                endpoint = f"https://{endpoint}"
+        
         credential = DefaultAzureCredential()
         return SearchClient(
-            endpoint=config.endpoint,
-            index_name=config.table_or_query,  # index name stored in table_or_query
+            endpoint=endpoint,
+            index_name=index_name,
             credential=credential,
         )
 

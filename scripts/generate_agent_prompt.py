@@ -25,7 +25,13 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 
 parser = argparse.ArgumentParser(description="Generate scenario-based agent prompt")
-parser.add_argument("--scenario", type=str, help="Scenario key from scenarios.json")
+parser.add_argument(
+    "--scenario",
+    nargs="?",
+    const="",
+    type=str,
+    help="Scenario key from scenarios.json"
+)
 parser.add_argument("--config", type=str, help="Path to scenarios.json")
 parser.add_argument("--out", type=str, help="Output path for prompt")
 args = parser.parse_args()
@@ -43,7 +49,8 @@ with open(scenarios_path, encoding="utf-8") as f:
 
 scenarios = scenarios_config.get("scenarios", {})
 
-scenario_key = args.scenario or os.getenv("SCENARIO") or os.getenv("AZURE_SCENARIO")
+scenario_arg = (args.scenario or "").strip()
+scenario_key = scenario_arg or os.getenv("SCENARIO") or os.getenv("AZURE_SCENARIO")
 if not scenario_key:
     scenario_key = next(iter(scenarios), "")
 

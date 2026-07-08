@@ -12,7 +12,9 @@
 #>
 
 param(
-    [string]$Scenario
+    [string]$Scenario,
+    [string]$SearchIndexName,
+    [string]$SearchConnectionName
 )
 
 Write-Host ""
@@ -41,8 +43,13 @@ if (Test-Path $venvPath) {
 }
 
 Write-Host "Generating scenario-based agent prompt..." -ForegroundColor Yellow
+$resolvedScenario = $null
+if (-not [string]::IsNullOrWhiteSpace($Scenario)) {
+    $resolvedScenario = $Scenario.Trim()
+}
+
 $genArgs = @()
-if ($Scenario) { $genArgs += @("--scenario", $Scenario) }
+if ($resolvedScenario) { $genArgs += @("--scenario", $resolvedScenario) }
 python (Join-Path $PSScriptRoot "generate_agent_prompt.py") @genArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Prompt generation failed." -ForegroundColor Red
@@ -51,7 +58,9 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Creating agents..." -ForegroundColor Yellow
 $createArgs = @()
-if ($Scenario) { $createArgs += @("--scenario", $Scenario) }
+if ($resolvedScenario) { $createArgs += @("--scenario", $resolvedScenario) }
+if ($SearchIndexName) { $createArgs += @("--index-name", $SearchIndexName) }
+if ($SearchConnectionName) { $createArgs += @("--connection-name", $SearchConnectionName) }
 python (Join-Path $PSScriptRoot "create_agent.py") @createArgs
 
 if ($LASTEXITCODE -eq 0) {
